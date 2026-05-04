@@ -27,6 +27,7 @@ var (
 	verifiedAuthProviders = []string{
 		"default/google-auth-provider",
 		"default/github-auth-provider",
+		"default/zitadel-auth-provider",
 	}
 
 	identityGroupResource = schema.GroupResource{

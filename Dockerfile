@@ -71,6 +71,9 @@ COPY --link --from=enterprise-tools /obot-tools /obot-tools
 COPY --link --from=provider /obot-tools /obot-tools
 COPY --chmod=0755 /tools/combine-envrc.sh /
 RUN /combine-envrc.sh && rm /combine-envrc.sh
+
+# Fork additions: bundle Zitadel auth provider tool
+COPY --from=bin /app/tools/zitadel-auth-provider /obot-tools/zitadel-auth-provider
 COPY --from=provider /bin/*-encryption-provider /bin/
 COPY --from=bin /app/bin/obot /bin/
 COPY --from=bin --link /app/ui/user/build-node /ui

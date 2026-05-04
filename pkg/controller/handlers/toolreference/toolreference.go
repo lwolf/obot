@@ -182,6 +182,9 @@ func (h *Handler) readFromRegistry(ctx context.Context, c client.Client) error {
 		return errors.Join(errs...)
 	}
 
+	// Always include fork-local built-in auth providers.
+	toAdd = append(toAdd, builtinAuthProviders()...)
+
 	if len(toAdd) == 0 {
 		// Don't accidentally delete all the tool references
 		log.Infof("Skipping registry apply because no tool references were resolved")
@@ -544,4 +547,25 @@ func (h *Handler) CleanupModelProvider(req router.Request, _ router.Response) er
 
 func modelName(modelProviderName, modelName string) string {
 	return name.SafeConcatName(system.ModelPrefix, modelProviderName, fmt.Sprintf("%x", sha256.Sum256([]byte(modelName))))
+}
+
+// builtinAuthProviders returns ToolReferences for auth providers bundled with this fork.
+// These are applied on every registry refresh alongside providers from remote registries.
+func builtinAuthProviders() []client.Object {
+	active := true
+	return []client.Object{
+		&v1.ToolReference{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "zitadel-auth-provider",
+				Namespace: system.DefaultNamespace,
+			},
+			Spec: v1.ToolReferenceSpec{
+				Type:    types.ToolReferenceTypeAuthProvider,
+				Builtin: true,
+				Active:  &active,
+				// Local GPTScript tool file bundled into the Docker image.
+				Reference: "/obot-tools/zitadel-auth-provider/tool.gpt",
+			},
+		},
+	}
 }
