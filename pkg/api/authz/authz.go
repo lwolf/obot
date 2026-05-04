@@ -81,6 +81,7 @@ var (
 		"/api/file-scanner-providers",
 		"/api/file-scanner-providers/",
 		"GET /api/bookstrap",
+		"GET /api/version",
 		"/api/models",
 		"/api/models/",
 		"/api/model-access-policies",
@@ -371,7 +372,6 @@ var (
 			"DELETE /api/me",
 			"PATCH /api/me",
 			"POST /api/logout-all",
-			"GET /api/version",
 			"GET /api/setup/oauth-complete",
 
 			// API key management for user's own keys
