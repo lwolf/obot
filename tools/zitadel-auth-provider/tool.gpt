@@ -1,7 +1,46 @@
----
-Name: Zitadel Auth Provider
-Type: daemon
-Metadata: {"envVars": [{"name": "ZITADEL_CLIENT_ID", "friendlyName": "Client ID", "description": "OAuth2 Client ID from your Zitadel project"}, {"name": "ZITADEL_CLIENT_SECRET", "friendlyName": "Client Secret", "description": "OAuth2 Client Secret from your Zitadel project", "sensitive": true}, {"name": "ZITADEL_ISSUER_URL", "friendlyName": "Issuer URL", "description": "Your Zitadel instance URL, e.g. https://your-instance.zitadel.cloud"}], "optionalEnvVars": [{"name": "ZITADEL_SCOPES", "friendlyName": "Scopes", "description": "Comma-separated list of OAuth2 scopes (default: openid,profile,email)"}]}
+Name: Zitadel
+Description: Auth provider for Zitadel (and any standard OIDC IdP)
+Metadata: noUserAuth: zitadel-auth-provider
+Credential: /obot-tools/tools/placeholder-credential as zitadel-auth-provider
 
-#!/bin/bash
-exec /bin/obot oidc-provider
+#!sys.daemon /bin/obot oidc-provider
+
+---
+!metadata:Zitadel:providerMeta
+{
+    "envVars": [
+        {
+            "name": "ZITADEL_CLIENT_ID",
+            "friendlyName": "Client ID",
+            "description": "OAuth2 Client ID from your Zitadel project",
+            "sensitive": false
+        },
+        {
+            "name": "ZITADEL_CLIENT_SECRET",
+            "friendlyName": "Client Secret",
+            "description": "OAuth2 Client Secret from your Zitadel project",
+            "sensitive": true
+        },
+        {
+            "name": "ZITADEL_ISSUER_URL",
+            "friendlyName": "Issuer URL",
+            "description": "Your Zitadel instance URL, e.g. https://your-instance.zitadel.cloud",
+            "sensitive": false
+        },
+        {
+            "name": "OBOT_AUTH_PROVIDER_COOKIE_SECRET",
+            "friendlyName": "Cookie Secret",
+            "description": "Secret used to encrypt cookies. Must be a random string of length 16, 24, or 32.",
+            "sensitive": true,
+            "hidden": true
+        }
+    ],
+    "optionalEnvVars": [
+        {
+            "name": "ZITADEL_SCOPES",
+            "friendlyName": "Scopes",
+            "description": "Comma-separated list of OAuth2 scopes (default: openid,profile,email)",
+            "sensitive": false
+        }
+    ]
+}
