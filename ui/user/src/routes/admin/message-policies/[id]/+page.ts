@@ -1,11 +1,17 @@
 import { handleRouteError } from '$lib/errors';
 import { AdminService, ChatService } from '$lib/services';
+import type { Version } from '$lib/services/chat/types';
 import { profile } from '$lib/stores';
 import type { PageLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 
 export const load: PageLoad = async ({ params, fetch }) => {
-	const version = await ChatService.getVersion({ fetch });
+	let version: Version = {};
+	try {
+		version = await ChatService.getVersion({ fetch });
+	} catch {
+		// default: redirect when version is unreachable
+	}
 	if (!version.messagePoliciesEnabled) {
 		throw redirect(302, '/admin');
 	}
