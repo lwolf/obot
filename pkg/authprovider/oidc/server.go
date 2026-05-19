@@ -130,18 +130,29 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Start starts the HTTP server on a random localhost port, prints its URL to out,
-// and blocks until ctx is cancelled.
-func (s *Server) Start(ctx context.Context, out io.Writer) error {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+// Start starts the HTTP server on the given port (e.g. "10240"), or a random
+// localhost port if port is empty. It blocks until ctx is cancelled.
+func (s *Server) Start(ctx context.Context, port string) error {
+	addr := "127.0.0.1:" + port
+	if port == "" {
+		addr = "127.0.0.1:0"
+	}
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	addr := ln.Addr().String()
-	fmt.Fprintf(out, "http://%s\n", addr)
+	serverURL := "http://" + ln.Addr().String()
 
 	mux := http.NewServeMux()
+	// GET / is the gptscript daemon health check — must return 200.
+	// POST / is called by gptscript after the health check; the response body
+	// is used by startProvider as the auth provider URL.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			fmt.Fprint(w, serverURL)
+		}
+	})
 	mux.HandleFunc("/oauth2/start", s.handleStart)
 	mux.HandleFunc("/oauth2/callback", s.handleCallback)
 	mux.HandleFunc("/oauth2/sign_out", s.handleSignOut)

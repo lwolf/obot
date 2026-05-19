@@ -15,7 +15,10 @@ import (
 )
 
 func main() {
-	if os.Getenv("GPTSCRIPT_EMBEDDED") != "false" {
+	// oidc-provider is invoked as a daemon subprocess by gptscript with
+	// GPTSCRIPT_EMBEDDED=true; bypass embedded gptscript to run as obot.
+	isOIDCProvider := len(os.Args) > 1 && os.Args[1] == "oidc-provider"
+	if !isOIDCProvider && os.Getenv("GPTSCRIPT_EMBEDDED") != "false" {
 		if embedded.Run(embedded.Options{}) {
 			return
 		}

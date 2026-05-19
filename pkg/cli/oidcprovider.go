@@ -54,8 +54,13 @@ func (o *OIDCProvider) Run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to initialize OIDC provider: %w", err)
 	}
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = os.Getenv("GPTSCRIPT_PORT")
+	}
+
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
-	return srv.Start(ctx, os.Stdout)
+	return srv.Start(ctx, port)
 }
