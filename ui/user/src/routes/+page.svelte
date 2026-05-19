@@ -71,8 +71,8 @@
 									src={provider.icon}
 									alt={provider.name}
 								/>
-								<span class="text-center text-sm font-light">Continue with {provider.name}</span>
 							{/if}
+							<span class="text-center text-sm font-light">Continue with {provider.name}</span>
 						</button>
 					{/each}
 					{#if authProviders.length === 0}

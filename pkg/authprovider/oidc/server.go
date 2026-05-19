@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	sessionCookieName = "_obot_oidc_session"
+	sessionCookieName = "obot_access_token"
 	stateCookieName   = "_obot_oidc_state"
 	cookieMaxAge      = 60 * 60 * 24 * 7 // 7 days
 	stateMaxAge       = 60 * 15           // 15 minutes
