@@ -149,6 +149,10 @@ func (s *Server) Start(ctx context.Context, port string) error {
 	// POST / is called by gptscript after the health check; the response body
 	// is used by startProvider as the auth provider URL.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == http.MethodPost {
 			fmt.Fprint(w, serverURL)
 		}
