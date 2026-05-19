@@ -28,9 +28,12 @@ func (o *OIDCProvider) Run(cmd *cobra.Command, _ []string) error {
 	clientSecret := os.Getenv("ZITADEL_CLIENT_SECRET")
 	cookieSecret := os.Getenv("OBOT_AUTH_PROVIDER_COOKIE_SECRET")
 
-	hostname := os.Getenv("OBOT_SERVER_HOSTNAME")
+	hostname := os.Getenv("OBOT_SERVER_PUBLIC_URL")
 	if hostname == "" {
-		return fmt.Errorf("OBOT_SERVER_HOSTNAME must be set")
+		hostname = os.Getenv("OBOT_SERVER_HOSTNAME")
+	}
+	if hostname == "" {
+		return fmt.Errorf("OBOT_SERVER_PUBLIC_URL must be set")
 	}
 
 	var scopes []string
