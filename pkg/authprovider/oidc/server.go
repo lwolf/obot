@@ -1,10 +1,13 @@
 // Package oidc implements an Obot auth provider that uses OIDC (OpenID Connect).
 // It implements the HTTP protocol expected by the Obot proxy manager:
 //
-//   - GET  /oauth2/start     — initiate auth flow
-//   - GET  /oauth2/callback  — handle IdP callback
-//   - GET  /oauth2/sign_out  — clear session
-//   - POST /obot-get-state   — return authenticated user state from session cookie
+//   - GET  /oauth2/start               — initiate auth flow
+//   - GET  /oauth2/callback            — handle IdP callback
+//   - GET  /oauth2/sign_out            — clear session
+//   - POST /obot-get-state             — return authenticated user state from session cookie
+//   - GET  /obot-get-user-info         — return user profile (avatar, display name) for a given access token
+//   - POST /obot-list-user-auth-groups — return group memberships for a given user ID
+//   - GET  /obot-list-auth-groups      — enumerate groups (not supported; returns 404)
 package oidc
 
 import (
@@ -21,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -31,6 +35,7 @@ const (
 	stateCookieName   = "_obot_oidc_state"
 	cookieMaxAge      = 60 * 60 * 24 * 7 // 7 days
 	stateMaxAge       = 60 * 15           // 15 minutes
+	refreshBuffer     = time.Minute       // refresh access token this long before it expires
 )
 
 // Config holds the configuration for the OIDC auth provider.
@@ -48,16 +53,26 @@ type Config struct {
 type oidcDiscovery struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+	UserinfoEndpoint      string `json:"userinfo_endpoint"`
 	JWKSURI               string `json:"jwks_uri"`
 }
 
 // session holds per-user session data stored in an encrypted cookie.
 type session struct {
-	Sub         string `json:"sub"`
-	Email       string `json:"email"`
-	Username    string `json:"username"`
-	AccessToken string `json:"access_token"`
-	ExpiresAt   int64  `json:"expires_at"` // unix timestamp, 0 means no expiry
+	Sub          string       `json:"sub"`
+	Email        string       `json:"email"`
+	Username     string       `json:"username"`
+	AccessToken  string       `json:"access_token"`
+	RefreshToken string       `json:"refresh_token"`
+	ExpiresAt    int64        `json:"expires_at"` // unix timestamp, 0 means no expiry
+	Groups       []groupEntry `json:"groups,omitempty"`
+}
+
+// groupEntry mirrors auth.GroupInfo for JSON serialization.
+type groupEntry struct {
+	ID      string  `json:"id"`
+	Name    string  `json:"name"`
+	IconURL *string `json:"iconURL"`
 }
 
 // stateData holds state data stored in a short-lived cookie.
@@ -85,10 +100,11 @@ type serializableState struct {
 
 // Server is the OIDC auth provider HTTP server.
 type Server struct {
-	cfg       Config
-	oauth2Cfg oauth2.Config
-	discovery oidcDiscovery
-	cipherKey [32]byte // AES-256 key derived from CookieSecret
+	cfg        Config
+	oauth2Cfg  oauth2.Config
+	discovery  oidcDiscovery
+	cipherKey  [32]byte // AES-256 key derived from CookieSecret
+	groupCache sync.Map // map[string (sub)] -> []groupEntry; populated at login, used for group lookups
 }
 
 // New creates a new OIDC server, fetching the OIDC discovery document at creation time.
@@ -161,6 +177,9 @@ func (s *Server) Start(ctx context.Context, port string) error {
 	mux.HandleFunc("/oauth2/callback", s.handleCallback)
 	mux.HandleFunc("/oauth2/sign_out", s.handleSignOut)
 	mux.HandleFunc("/obot-get-state", s.handleGetState)
+	mux.HandleFunc("/obot-get-user-info", s.handleGetUserInfo)
+	mux.HandleFunc("/obot-list-user-auth-groups", s.handleListUserAuthGroups)
+	mux.HandleFunc("/obot-list-auth-groups", s.handleListAuthGroups)
 
 	srv := &http.Server{Handler: mux}
 
@@ -201,10 +220,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   stateMaxAge,
 		HttpOnly: true,
-		Secure:   strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https"),
+		Secure:   isHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 	})
 
-	authURL := s.oauth2Cfg.AuthCodeURL(nonce, oauth2.AccessTypeOnline)
+	// AccessTypeOffline requests a refresh_token so we can extend sessions transparently.
+	authURL := s.oauth2Cfg.AuthCodeURL(nonce, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
@@ -230,10 +251,11 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Clear the state cookie.
 	http.SetCookie(w, &http.Cookie{
-		Name:   stateCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     stateCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		SameSite: http.SameSiteLaxMode,
 	})
 
 	code := r.URL.Query().Get("code")
@@ -269,15 +291,24 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	sub, _ := claims["sub"].(string)
 	email, _ := claims["email"].(string)
 	username := pickUsername(claims)
+	groups := extractGroupsFromClaims(claims)
 
 	sess := session{
-		Sub:         sub,
-		Email:       email,
-		Username:    username,
-		AccessToken: token.AccessToken,
+		Sub:          sub,
+		Email:        email,
+		Username:     username,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		Groups:       groups,
 	}
 	if !token.Expiry.IsZero() {
 		sess.ExpiresAt = token.Expiry.Unix()
+	}
+
+	// Cache group memberships by subject so /obot-list-user-auth-groups can serve them
+	// even when no session cookie is present in that lookup request.
+	if sub != "" {
+		s.groupCache.Store(sub, groups)
 	}
 
 	encrypted, err := s.encrypt(sess)
@@ -286,13 +317,21 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxAge := cookieMaxAge
+	if !token.Expiry.IsZero() {
+		if d := int(time.Until(token.Expiry).Seconds()); d > 0 && d < maxAge {
+			maxAge = d
+		}
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    encrypted,
 		Path:     "/",
-		MaxAge:   cookieMaxAge,
+		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https"),
+		Secure:   isHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 	})
 
 	rd := sd.Rd
@@ -305,10 +344,11 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 // handleSignOut clears the session cookie and redirects.
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
-		Name:   sessionCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		SameSite: http.SameSiteLaxMode,
 	})
 
 	rd := r.URL.Query().Get("rd")
@@ -352,11 +392,73 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var setCookies []string
+
+	// Proactively refresh the access token when it is close to expiry.
+	if sess.RefreshToken != "" && sess.ExpiresAt != 0 && time.Until(time.Unix(sess.ExpiresAt, 0)) < refreshBuffer {
+		// Force an immediate refresh by presenting the token as already expired.
+		staleToken := &oauth2.Token{
+			AccessToken:  sess.AccessToken,
+			RefreshToken: sess.RefreshToken,
+			Expiry:       time.Now().Add(-time.Second),
+		}
+		if newToken, refreshErr := s.oauth2Cfg.TokenSource(r.Context(), staleToken).Token(); refreshErr == nil && newToken.AccessToken != sess.AccessToken {
+			sess.AccessToken = newToken.AccessToken
+			if newToken.RefreshToken != "" {
+				sess.RefreshToken = newToken.RefreshToken
+			}
+			if !newToken.Expiry.IsZero() {
+				sess.ExpiresAt = newToken.Expiry.Unix()
+			}
+
+			// Update group cache if a new ID token was returned.
+			if rawIDToken, ok := newToken.Extra("id_token").(string); ok && rawIDToken != "" {
+				if claims, parseErr := parseIDTokenClaims(rawIDToken); parseErr == nil {
+					groups := extractGroupsFromClaims(claims)
+					sess.Groups = groups
+					if sess.Sub != "" {
+						s.groupCache.Store(sess.Sub, groups)
+					}
+				}
+			}
+
+			if encryptedSession, encErr := s.encrypt(sess); encErr == nil {
+				maxAge := cookieMaxAge
+				if sess.ExpiresAt != 0 {
+					if d := int(time.Until(time.Unix(sess.ExpiresAt, 0)).Seconds()); d > 0 && d < maxAge {
+						maxAge = d
+					}
+				}
+				proto := ""
+				if fwdProto := sr.Header["X-Forwarded-Proto"]; len(fwdProto) > 0 {
+					proto = fwdProto[0]
+				}
+				c := &http.Cookie{
+					Name:     sessionCookieName,
+					Value:    encryptedSession,
+					Path:     "/",
+					MaxAge:   maxAge,
+					HttpOnly: true,
+					Secure:   strings.HasPrefix(proto, "https"),
+					SameSite: http.SameSiteLaxMode,
+				}
+				setCookies = append(setCookies, c.String())
+			}
+		}
+		// Refresh failures are non-fatal: continue with the existing session until it hard-expires.
+	}
+
+	// Warm the group cache from session data after a daemon restart.
+	if sess.Sub != "" && len(sess.Groups) > 0 {
+		s.groupCache.Store(sess.Sub, sess.Groups)
+	}
+
 	state := serializableState{
 		User:              sess.Sub,
 		Email:             sess.Email,
 		PreferredUsername: sess.Username,
 		AccessToken:       sess.AccessToken,
+		SetCookies:        setCookies,
 	}
 	if sess.ExpiresAt != 0 {
 		t := time.Unix(sess.ExpiresAt, 0)
@@ -364,7 +466,79 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(state)
+	json.NewEncoder(w).Encode(state) //nolint:errcheck
+}
+
+// handleGetUserInfo fetches the user's profile from the OIDC userinfo endpoint.
+// The gateway calls this with Authorization: Bearer <access_token>.
+// It returns a JSON object with at minimum "name" and "picture" fields.
+func (s *Server) handleGetUserInfo(w http.ResponseWriter, r *http.Request) {
+	accessToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if accessToken == "" {
+		http.Error(w, "missing access token", http.StatusUnauthorized)
+		return
+	}
+
+	userinfoURL := s.discovery.UserinfoEndpoint
+	if userinfoURL == "" {
+		// Fall back to the conventional path (most OIDC providers support this).
+		userinfoURL = strings.TrimSuffix(s.cfg.IssuerURL, "/") + "/userinfo"
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, userinfoURL, nil)
+	if err != nil {
+		http.Error(w, "failed to build userinfo request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, "userinfo request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "userinfo endpoint returned "+resp.Status, http.StatusBadGateway)
+		return
+	}
+
+	// Pass the userinfo response through as-is; the gateway reads "name" and "picture".
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body) //nolint:errcheck
+}
+
+// handleListUserAuthGroups returns the group memberships for the user ID in the request body.
+// The gateway calls this with the provider user ID (sub) as the plain-text POST body.
+// Groups are populated from the ID token at login time and cached in memory.
+func (s *Server) handleListUserAuthGroups(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	sub := strings.TrimSpace(string(body))
+
+	var groups []groupEntry
+	if sub != "" {
+		if cached, ok := s.groupCache.Load(sub); ok {
+			groups, _ = cached.([]groupEntry)
+		}
+	}
+	if groups == nil {
+		groups = []groupEntry{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(groups) //nolint:errcheck
+}
+
+// handleListAuthGroups is the admin group-search endpoint.
+// Generic OIDC providers do not expose a standard group-enumeration API, so we return 404
+// and let the gateway fall back to groups cached from previous logins.
+func (s *Server) handleListAuthGroups(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
 }
 
 // --- helpers ---
@@ -411,6 +585,55 @@ func parseIDTokenClaims(rawJWT string) (map[string]any, error) {
 	return claims, nil
 }
 
+// extractGroupsFromClaims extracts group/role memberships from standard OIDC claims.
+// It checks "groups" and "roles" claims (Okta, Keycloak, Azure AD, etc.)
+// and Zitadel's project-role claim.
+func extractGroupsFromClaims(claims map[string]any) []groupEntry {
+	seen := make(map[string]bool)
+	var groups []groupEntry
+
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			groups = append(groups, groupEntry{ID: name, Name: name})
+		}
+	}
+
+	for _, name := range stringSliceFromClaim(claims["groups"]) {
+		add(name)
+	}
+	for _, name := range stringSliceFromClaim(claims["roles"]) {
+		add(name)
+	}
+
+	// Zitadel project roles arrive as map[roleName]map[orgID]interface{}.
+	if zitadelRoles, ok := claims["urn:zitadel:iam:org:project:roles"].(map[string]any); ok {
+		for roleName := range zitadelRoles {
+			add(roleName)
+		}
+	}
+
+	return groups
+}
+
+// stringSliceFromClaim converts a claim value to a string slice, handling both
+// []string and []interface{} (what JSON unmarshalling produces).
+func stringSliceFromClaim(v any) []string {
+	switch val := v.(type) {
+	case []string:
+		return val
+	case []any:
+		result := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
 func pickUsername(claims map[string]any) string {
 	for _, key := range []string{"preferred_username", "nickname", "name", "email", "sub"} {
 		if v, ok := claims[key].(string); ok && v != "" {
@@ -437,6 +660,11 @@ func randomBase64(n int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// isHTTPS reports whether the request arrived over HTTPS (direct TLS or via a proxy).
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // encrypt marshals v to JSON and encrypts it with AES-256-GCM.
@@ -493,64 +721,12 @@ func (s *Server) decrypt(encoded string, dst any) error {
 	return json.Unmarshal(plain, dst)
 }
 
-// fetchUserProfile fetches user profile from the OIDC userinfo endpoint.
-// This is used by identity.go's fetchProviderGroupLookupID.
-func fetchUserProfile(ctx context.Context, providerURL, accessToken string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, providerURL+"/userinfo", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var profile map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
-		return nil, err
-	}
-	return profile, nil
-}
-
-// Userinfo wraps fetchUserProfile for use by external callers.
-func (s *Server) Userinfo(ctx context.Context, accessToken string) (map[string]any, error) {
-	// The userinfo endpoint is at the issuer URL.
-	issuer := strings.TrimSuffix(s.cfg.IssuerURL, "/")
-	// Try to get userinfo endpoint from discovery (not stored, fetch inline).
-	_ = issuer
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, issuer+"/oidc/v1/userinfo", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // ExternalCallbackURL constructs the callback URL from the obot server hostname.
 func ExternalCallbackURL(hostname string) string {
 	return strings.TrimSuffix(hostname, "/") + "/oauth2/callback"
 }
 
-// ProviderURL returns the URL where this server's UserInfo endpoint is accessible,
-// for use by auth.ContextWithProviderURL.
-// This is the issuer URL since userinfo is served from there.
-func (s *Server) ProviderURL() string {
-	return strings.TrimSuffix(s.cfg.IssuerURL, "/")
-}
-
-// validateURL is used to check if a URL is a valid URL that could be used as a redirect.
+// validateURL checks whether a URL is safe to use as a redirect target.
 func validateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
